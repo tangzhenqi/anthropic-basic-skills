@@ -787,6 +787,9 @@ def print_human(item):
         tag = "" if fl == "today" else f" {FRESHNESS_LABEL.get(fl, '')}({ff.get('today_date')})"
         print(f"    主力净流入 最新: {fmt_num(ff.get('today_main_net'), '元')}{tag}   "
               f"近{ff.get('days_counted')}日累计: {fmt_num(ff.get('sum5_main_net'), '元')}")
+        if fl == "today":
+            print(f"      ⚠️ 盘中'最新'为瞬时值, 会回摆(可同日由大幅净流出翻为净流入), 勿据此单独定方向; "
+                  f"看日内累计趋势或收盘值, 并注意大单可拆成小单(主力/散户分类有盲点)")
     kl = item.get("kline") or {}
     if kl.get("ok"):
         tt, avg, pctl = kl.get("turnover_today"), kl.get("turnover_avg20"), kl.get("turnover_pctl")

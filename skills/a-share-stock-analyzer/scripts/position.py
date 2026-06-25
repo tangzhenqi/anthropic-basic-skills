@@ -122,6 +122,13 @@ def build(code, shares, cost, price, anchors, kline_ok,
         "target": target, "target_basis": target_basis, "target_tooclose": target_tooclose,
     }
 
+    # 沉没成本锚识别: 成本远高于一切技术位(尤其60日前高)时, 多半是把往轮已实现亏损摊到剩余股上
+    # 算出的'等效成本', 按它得到的盈亏平衡/回本价/触发盈亏全部失真(典型: 价到目标仍显示亏损)。
+    # 打标 → 渲染层警示: 决策应基于现价与技术位, 不基于回本价。(R:R 用现价算, 不受此污染。)
+    high_60 = next((v for n, v in anchors if n == "60日前高" and isinstance(v, (int, float))), None)
+    out["high_60"] = high_60
+    out["cost_anchor_suspect"] = bool(high_60 and cost > high_60 * 1.1)
+
     # 止损/目标的金额与盈亏比
     if stop is not None:
         out["stop_pnl"] = shares * (stop - cost)
@@ -151,11 +158,23 @@ def build(code, shares, cost, price, anchors, kline_ok,
     if add_shares and add_price:
         ns = shares + add_shares
         nc = (pos_cost + add_shares * add_price) / ns
+        # 新钱独立视角: 只评估'加仓这批'以 add_price 为成本、用同一技术止损/目标的盈亏与 R:R。
+        # 混合均价被老仓(尤其沉没成本锚)污染时, 加不加该看这批新钱划不划算, 不看被污染的整体。
+        nm_rr = nm_rr_distorted = nm_stop_pnl = nm_target_pnl = None
+        if stop is not None:
+            nm_stop_pnl = add_shares * (stop - add_price)
+        if target is not None:
+            nm_target_pnl = add_shares * (target - add_price)
+        if stop is not None and target is not None and add_price > stop:
+            nm_rr = (target - add_price) / (add_price - stop)
+            nm_rr_distorted = (add_price - stop) / add_price * 100 < 1.0
         out["add"] = {"add_shares": add_shares, "add_price": add_price,
                       "added_capital": add_shares * add_price,
                       "new_shares": ns, "new_cost": nc,
                       "new_breakeven_fee": nc * (1 + fee_pct / 100),
-                      "new_pos_now": ns * price, "new_pnl": ns * (price - nc)}
+                      "new_pos_now": ns * price, "new_pnl": ns * (price - nc),
+                      "nm_stop_pnl": nm_stop_pnl, "nm_target_pnl": nm_target_pnl,
+                      "nm_rr": nm_rr, "nm_rr_distorted": nm_rr_distorted}
     # 减仓情景: 已实现盈亏 + 剩余
     if trim_shares and trim_price:
         ts = min(trim_shares, shares)
@@ -197,6 +216,10 @@ def render(o, live):
              f"浮动盈亏: {_money(o['pnl'])} ({o['pnl_pct']:+.2f}%)")
     L.append(f"  盈亏平衡: {fmt_num(o['breakeven'])}(成本价)  "
              f"/ {fmt_num(o['breakeven_fee'])}(含费≈{o['fee_pct']:g}%双边)")
+    if o.get("cost_anchor_suspect"):
+        L.append(f"  ⚠️ 成本 {fmt_num(o['cost'])} 高于60日前高 {fmt_num(o['high_60'])}, 疑似含已实现亏损"
+                 f"摊销的沉没成本锚 → 上方盈亏平衡/回本价、下方各档'触发盈亏'均按此失真")
+        L.append(f"     (典型: 价到目标仍显示亏损)。决策请看现价与技术位/盈亏比, 不要盯回本价。")
     # 止损 / 目标 / 盈亏比
     L.append("-" * 60)
     if o.get("stop") is not None:
@@ -237,6 +260,17 @@ def render(o, live):
         L.append(f"     新持仓 {a['new_shares']:,.0f}股   新均价 {fmt_num(a['new_cost'])}"
                  f"   新平衡(含费) {fmt_num(a['new_breakeven_fee'])}")
         L.append(f"     加仓后浮动盈亏 {_money(a['new_pnl'])}")
+        # 新钱独立视角(判断'该不该加'看这批, 不看被老仓/沉没成本污染的整体)
+        if a.get("nm_rr") is not None:
+            if a.get("nm_rr_distorted"):
+                L.append(f"     ▸ 新钱视角: 止损{_money(a['nm_stop_pnl'])} / 目标{_money(a['nm_target_pnl'])}"
+                         f"   R:R=1:{a['nm_rr']:.1f} ⚠️失真(买价距止损过近)")
+            else:
+                v = "划算(≥2)" if a["nm_rr"] >= 2 else ("一般(1~2)" if a["nm_rr"] >= 1 else "不划算(<1)")
+                L.append(f"     ▸ 新钱视角: 止损{_money(a['nm_stop_pnl'])} / 目标{_money(a['nm_target_pnl'])}"
+                         f"   R:R=1:{a['nm_rr']:.2f} → {v}")
+        elif a.get("nm_stop_pnl") is not None or a.get("nm_target_pnl") is not None:
+            L.append(f"     ▸ 新钱视角: 止损{_money(a.get('nm_stop_pnl'))} / 目标{_money(a.get('nm_target_pnl'))}")
     # 减仓情景
     if o.get("trim"):
         t = o["trim"]
