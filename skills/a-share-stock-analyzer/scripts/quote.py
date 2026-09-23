@@ -356,6 +356,8 @@ def fetch_tencent(tencent_code):
         "high": g(33),
         "low": g(34),
         "turnover_rate": g(38),
+        "volume_lots": g(36),   # 成交量(手), 与 amount_wan 合算日内均价(t_plan.py 用)
+        "amount_wan": g(37),    # 成交额(万元)
         "timestamp": ts.isoformat() if ts else None,
         "is_today": is_today(ts),
     }
@@ -606,6 +608,9 @@ def fetch_kline(secid, lmt=120):
                 "high": float(p[3]),
                 "low": float(p[4]),
                 "turnover": float(p[10]) if len(p) > 10 and p[10] not in ("", "-") else None,
+                "amp": float(p[7]) if len(p) > 7 and p[7] not in ("", "-") else None,
+                "vol": float(p[5]),     # 成交量(手)
+                "amount": float(p[6]),  # 成交额(元)
             })
         except (IndexError, ValueError):
             continue
@@ -616,6 +621,7 @@ def fetch_kline(secid, lmt=120):
     highs = [r["high"] for r in rows]
     lows = [r["low"] for r in rows]
     turns = [r["turnover"] for r in rows if r["turnover"] is not None]
+    amps = [r["amp"] for r in rows if r["amp"] is not None]
     today_turn = turns[-1] if turns else None
     return {
         "ok": True,
@@ -631,6 +637,12 @@ def fetch_kline(secid, lmt=120):
         "turnover_today": today_turn,
         "turnover_avg20": _avg(turns, 20),
         "turnover_pctl": _pctl(turns[-60:], today_turn),
+        # 近20日平均日振幅(%), 供 position.py 判断止损是否落在该票正常波动(噪声)之内
+        "amp_avg20": _avg(amps, 20),
+        # 最近两根日K(可能含盘中未完成的当日K), 供 t_plan.py 取'昨日'高/低/均价
+        "recent_bars": [{"date": r["date"], "high": r["high"], "low": r["low"], "close": r["close"],
+                         "vwap": r["amount"] / (r["vol"] * 100) if r["vol"] else None}
+                        for r in rows[-2:]],
         # 近 1/5/20 交易日收益率(%), 供相对强弱(个股 vs 大盘)与大盘择时使用
         "ret_1": _ret(closes, 1),
         "ret_5": _ret(closes, 5),

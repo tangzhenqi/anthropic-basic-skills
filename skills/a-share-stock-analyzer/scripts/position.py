@@ -17,6 +17,7 @@
     python3 position.py 000066 --shares 3500 --cost 18.2 --add-shares 1000 --add-price 17.7
     python3 position.py 000066 --shares 3500 --cost 18.2 --trim-shares 1500 --trim-price 18.4
     python3 position.py 000066 --shares 3500 --cost 18.2 --price 17.8 --no-fetch   # 手填现价不抓
+    python3 position.py 000066 --shares 3500 --cost 18.2 --stop-amp-mult 1.5  # 止损留更宽波动空间
     python3 position.py 000066 --shares 3500 --cost 18.2 --json
 
 退出码: 0 正常; 2 现价抓取失败且未 --price 手填(无法算 PnL)。
@@ -24,6 +25,7 @@
 
 import sys
 import json
+import math
 import argparse
 from datetime import datetime
 
@@ -52,26 +54,46 @@ def _live(code):
         "ma20": kl.get("ma20"), "ma60": kl.get("ma60"),
         "high_20": kl.get("high_20"), "low_20": kl.get("low_20"),
         "high_60": kl.get("high_60"), "low_60": kl.get("low_60"),
+        "amp_avg20": kl.get("amp_avg20"),
         "kline_ok": kl.get("ok", False),
     }
 
 
 # 止损/目标自动挂靠时的最小缓冲: 现价正贴某锚点时, 紧贴它做止损会被噪声秒扫、
-# 且令 R:R 失真(风险分母≈0)。故优先取'至少离现价 BUFFER% 的'锚点; 都太近才退最近的并标注。
+# 且令 R:R 失真(风险分母≈0)。目标用固定 BUFFER%; 止损另按该票波动放大(见 stop_buffer_pct)。
 ANCHOR_BUFFER_PCT = 1.5
+# 止损缓冲 = max(固定下限, 倍数 × 近20日平均日振幅): 止损离买价须盖得住该票一日正常波动,
+# 高振幅票固定 1.5% 远不够(实战: MA60 距现价 1.76%, 而日均振幅 2.78%, 挂 MA60 即扎进噪声)。
+# 插针另由'收盘破位且站不回'的执行纪律过滤(SKILL Step 6), 故 1 倍即可, 不再层层加码。
+STOP_AMP_MULT = 1.0
+
+
+def stop_buffer_pct(amp_avg20, mult=STOP_AMP_MULT):
+    """止损最小距离(%): 固定下限与 mult×近20日均振幅 取大; 无振幅数据退固定下限。"""
+    if isinstance(amp_avg20, (int, float)) and amp_avg20 > 0:
+        return max(ANCHOR_BUFFER_PCT, mult * amp_avg20)
+    return ANCHOR_BUFFER_PCT
 
 
 def suggest_stop(price, anchors, buffer_pct=ANCHOR_BUFFER_PCT):
-    """止损 = 现价下方最近、且至少 buffer% 之外的支撑; 都太近则退最近的并标 too_close。"""
+    """止损 = 结构位 + 波动空间。返回 (止损价, 挂靠锚点名, 是否下移)。
+
+    - 下方最近支撑已在 buffer% 之外 → 直接挂靠它;
+    - 最近支撑落在 buffer% 之内(贴太近, 会被正常波动扫掉) → 仍以它为结构依据, 但止损下移到
+      现价×(1−buffer%), 即'破该位且再走出一日正常波动'才算看错, 不跳到远处更深的锚点
+      (跳远会把'回踩支撑处入场'这种好入场的止损拉得过宽、R:R 虚低);
+    - 下方无任何锚点 → 不臆造, 返回 None。
+    """
     below = [(name, v) for name, v in anchors if isinstance(v, (int, float)) and v < price]
     if not below:
         return None, None, False
-    far = [(n, v) for n, v in below if (price - v) / price * 100 >= buffer_pct]
-    if far:
-        name, v = max(far, key=lambda x: x[1])
-        return v, name, False
-    name, v = max(below, key=lambda x: x[1])  # 全部过近 → 退最近的, 标注
-    return v, name, True
+    floor = price * (1 - buffer_pct / 100)
+    near = [(n, v) for n, v in below if v > floor]
+    if near:
+        name, _ = min(near, key=lambda x: x[1])  # 缓冲区内最低的那个结构位, 止损须在它之下
+        return math.floor(floor * 100 + 1e-6) / 100, name, True  # 向下取到分: 进位会让止损落回缓冲内
+    name, v = max(below, key=lambda x: x[1])
+    return v, name, False
 
 
 def suggest_target(price, anchors, buffer_pct=ANCHOR_BUFFER_PCT):
@@ -100,17 +122,20 @@ def pnl_at(level, shares, cost, price):
 
 def build(code, shares, cost, price, anchors, kline_ok,
           stop=None, target=None, fee_pct=0.13,
-          add_shares=None, add_price=None, trim_shares=None, trim_price=None):
+          add_shares=None, add_price=None, trim_shares=None, trim_price=None,
+          amp_avg20=None, stop_amp_mult=STOP_AMP_MULT):
     pos_cost = shares * cost
     pos_now = shares * price
     pnl = pos_now - pos_cost
     breakeven_fee = cost * (1 + fee_pct / 100)  # 含双边费的近似平衡价
+    stop_buf = stop_buffer_pct(amp_avg20, stop_amp_mult)
 
+    auto_stop, auto_target = stop is None and kline_ok, target is None and kline_ok
     stop_basis = target_basis = None
-    stop_tooclose = target_tooclose = False
-    if stop is None and kline_ok:
-        stop, stop_basis, stop_tooclose = suggest_stop(price, anchors)
-    if target is None and kline_ok:
+    stop_widened = target_tooclose = False
+    if auto_stop:
+        stop, stop_basis, stop_widened = suggest_stop(price, anchors, stop_buf)
+    if auto_target:
         target, target_basis, target_tooclose = suggest_target(price, anchors)
 
     out = {
@@ -118,7 +143,8 @@ def build(code, shares, cost, price, anchors, kline_ok,
         "pos_cost": pos_cost, "pos_now": pos_now, "pnl": pnl,
         "pnl_pct": (price / cost - 1) * 100 if cost else None,
         "breakeven": cost, "breakeven_fee": breakeven_fee, "fee_pct": fee_pct,
-        "stop": stop, "stop_basis": stop_basis, "stop_tooclose": stop_tooclose,
+        "amp_avg20": amp_avg20, "stop_amp_mult": stop_amp_mult, "stop_buffer_pct": stop_buf,
+        "stop": stop, "stop_basis": stop_basis, "stop_widened": stop_widened,
         "target": target, "target_basis": target_basis, "target_tooclose": target_tooclose,
     }
 
@@ -137,11 +163,11 @@ def build(code, shares, cost, price, anchors, kline_ok,
         out["target_pnl"] = shares * (target - cost)
         out["target_dist_pct"] = (target / price - 1) * 100
     # 盈亏比 R:R(以现价为基准的前瞻: 上方空间 / 下方风险)
-    # ⚠️ 现价距止损过近(风险分母极小)会让 R:R 虚高失真, 标 distorted 供渲染层提示。
+    # ⚠️ 止损落在正常波动之内(多为手填过紧)会让 R:R 虚高失真, 标 distorted 供渲染层提示。
     if stop is not None and target is not None and price > stop:
         risk_pct = (price - stop) / price * 100
         out["rr"] = (target - price) / (price - stop)
-        out["rr_distorted"] = risk_pct < 1.0 or stop_tooclose
+        out["rr_distorted"] = risk_pct < stop_buf - 1e-9
 
     # PnL 阶梯: 关键价位排序后逐档
     levels = {}
@@ -158,21 +184,35 @@ def build(code, shares, cost, price, anchors, kline_ok,
     if add_shares and add_price:
         ns = shares + add_shares
         nc = (pos_cost + add_shares * add_price) / ns
-        # 新钱独立视角: 只评估'加仓这批'以 add_price 为成本、用同一技术止损/目标的盈亏与 R:R。
+        # 新钱独立视角: 只评估'加仓这批'以 add_price 为成本的盈亏与 R:R。
         # 混合均价被老仓(尤其沉没成本锚)污染时, 加不加该看这批新钱划不划算, 不看被污染的整体。
+        # 止损/目标须相对 add_price 重新挂靠: 挂单价常远离现价, 沿用现价口径的止损可能在买价之上。
+        nm_stop, nm_stop_basis, nm_target, nm_target_basis = stop, stop_basis, target, target_basis
+        nm_stop_widened = False
+        if auto_stop:
+            nm_stop, nm_stop_basis, nm_stop_widened = suggest_stop(add_price, anchors, stop_buf)
+        if auto_target:
+            nm_target, nm_target_basis, _ = suggest_target(add_price, anchors)
+        # 手填价位与买价方向矛盾(止损≥买价 / 目标≤买价)时不算, 交渲染层提示
+        nm_stop_invalid = nm_stop is not None and nm_stop >= add_price
+        nm_target_invalid = nm_target is not None and nm_target <= add_price
         nm_rr = nm_rr_distorted = nm_stop_pnl = nm_target_pnl = None
-        if stop is not None:
-            nm_stop_pnl = add_shares * (stop - add_price)
-        if target is not None:
-            nm_target_pnl = add_shares * (target - add_price)
-        if stop is not None and target is not None and add_price > stop:
-            nm_rr = (target - add_price) / (add_price - stop)
-            nm_rr_distorted = (add_price - stop) / add_price * 100 < 1.0
+        if nm_stop is not None and not nm_stop_invalid:
+            nm_stop_pnl = add_shares * (nm_stop - add_price)
+        if nm_target is not None and not nm_target_invalid:
+            nm_target_pnl = add_shares * (nm_target - add_price)
+        if nm_stop_pnl is not None and nm_target_pnl is not None:
+            nm_rr = (nm_target - add_price) / (add_price - nm_stop)
+            nm_rr_distorted = (add_price - nm_stop) / add_price * 100 < stop_buf - 1e-9
         out["add"] = {"add_shares": add_shares, "add_price": add_price,
                       "added_capital": add_shares * add_price,
                       "new_shares": ns, "new_cost": nc,
                       "new_breakeven_fee": nc * (1 + fee_pct / 100),
                       "new_pos_now": ns * price, "new_pnl": ns * (price - nc),
+                      "nm_stop": nm_stop, "nm_stop_basis": nm_stop_basis,
+                      "nm_stop_widened": nm_stop_widened,
+                      "nm_target": nm_target, "nm_target_basis": nm_target_basis,
+                      "nm_stop_invalid": nm_stop_invalid, "nm_target_invalid": nm_target_invalid,
                       "nm_stop_pnl": nm_stop_pnl, "nm_target_pnl": nm_target_pnl,
                       "nm_rr": nm_rr, "nm_rr_distorted": nm_rr_distorted}
     # 减仓情景: 已实现盈亏 + 剩余
@@ -194,6 +234,27 @@ def _money(v):
 
 def _amt(v):
     return "—" if v is None else f"{v:,.0f}元"
+
+
+def _buf_note(o):
+    """止损缓冲的来源说明: 波动放大 or 固定下限。"""
+    amp = o.get("amp_avg20")
+    if isinstance(amp, (int, float)) and amp > 0:
+        return f"(≈{o['stop_amp_mult']:g}×近20日均振幅 {amp:.2f}%, 下限 {ANCHOR_BUFFER_PCT:g}%)"
+    return f"(无振幅数据, 取固定下限 {ANCHOR_BUFFER_PCT:g}%)"
+
+
+def _nm_level(a, kind):
+    """新钱视角的止损/目标价位文字: 价位 + 挂靠依据, 或无效/缺失原因。"""
+    v, basis = a.get(f"nm_{kind}"), a.get(f"nm_{kind}_basis")
+    if v is None:
+        return "—(下方/上方无锚点, 不臆造)"
+    if a.get(f"nm_{kind}_invalid"):
+        side = "≥" if kind == "stop" else "≤"
+        return f"{fmt_num(v)} ⚠️手填价{side}买价, 对这批新钱无效"
+    if not basis:
+        return f"{fmt_num(v)}(手填)"
+    return f"{fmt_num(v)}[{basis}{', 下移出正常波动' if a.get(f'nm_{kind}_widened') else ''}]"
 
 
 def render(o, live):
@@ -223,10 +284,16 @@ def render(o, live):
     # 止损 / 目标 / 盈亏比
     L.append("-" * 60)
     if o.get("stop") is not None:
-        basis = f"  挂靠[{o['stop_basis']}]" if o.get("stop_basis") else "  (手填)"
-        warn = "  ⚠️距现价过近(支撑都太贴), 偏紧易被噪声扫" if o.get("stop_tooclose") else ""
+        if not o.get("stop_basis"):
+            basis = "  (手填)"
+        elif o.get("stop_widened"):
+            basis = f"  挂靠[{o['stop_basis']}, 贴太近→下移出正常波动]"
+        else:
+            basis = f"  挂靠[{o['stop_basis']}]"
         L.append(f"  🛑 止损 {fmt_num(o['stop'])}{basis}   触发亏损 {_money(o['stop_pnl'])}"
-                 f"   距现价 {o['stop_dist_pct']:+.2f}%{warn}")
+                 f"   距现价 {o['stop_dist_pct']:+.2f}%")
+        L.append(f"     止损最小距离 {o['stop_buffer_pct']:.2f}%  {_buf_note(o)}"
+                 f"; 执行按'收盘破位且次日站不回', 不碰即砍")
     else:
         L.append("  🛑 止损: 无K线/未手填 → 不臆造, 请 --stop 指定")
     if o.get("target") is not None:
@@ -238,8 +305,8 @@ def render(o, live):
         L.append("  🎯 目标: 无K线/未手填 → 不臆造, 请 --target 指定")
     if o.get("rr") is not None:
         if o.get("rr_distorted"):
-            L.append(f"  ⚖️ 盈亏比 R:R = 1:{o['rr']:.1f} ⚠️失真(止损距现价过近, 风险分母极小)"
-                     f" → 用更下方支撑做止损再看 R:R")
+            L.append(f"  ⚖️ 盈亏比 R:R = 1:{o['rr']:.1f} ⚠️失真(止损在正常波动之内, 风险分母过小)"
+                     f" → 止损放到 {o['stop_buffer_pct']:.2f}% 之外再看 R:R")
         else:
             verdict = "划算(≥2)" if o["rr"] >= 2 else ("一般(1~2)" if o["rr"] >= 1 else "不划算(<1)")
             L.append(f"  ⚖️ 盈亏比 R:R = 1:{o['rr']:.2f}（现价上方空间 ÷ 下方风险）→ {verdict}")
@@ -261,16 +328,18 @@ def render(o, live):
                  f"   新平衡(含费) {fmt_num(a['new_breakeven_fee'])}")
         L.append(f"     加仓后浮动盈亏 {_money(a['new_pnl'])}")
         # 新钱独立视角(判断'该不该加'看这批, 不看被老仓/沉没成本污染的整体)
+        # 止损/目标已相对加仓价重新挂靠, 故单列价位
+        L.append(f"     ▸ 新钱视角(相对买价 {fmt_num(a['add_price'])}): "
+                 f"止损 {_nm_level(a, 'stop')} / 目标 {_nm_level(a, 'target')}")
         if a.get("nm_rr") is not None:
             if a.get("nm_rr_distorted"):
-                L.append(f"     ▸ 新钱视角: 止损{_money(a['nm_stop_pnl'])} / 目标{_money(a['nm_target_pnl'])}"
-                         f"   R:R=1:{a['nm_rr']:.1f} ⚠️失真(买价距止损过近)")
+                rr_txt = f"R:R=1:{a['nm_rr']:.1f} ⚠️失真(止损在正常波动之内)"
             else:
                 v = "划算(≥2)" if a["nm_rr"] >= 2 else ("一般(1~2)" if a["nm_rr"] >= 1 else "不划算(<1)")
-                L.append(f"     ▸ 新钱视角: 止损{_money(a['nm_stop_pnl'])} / 目标{_money(a['nm_target_pnl'])}"
-                         f"   R:R=1:{a['nm_rr']:.2f} → {v}")
+                rr_txt = f"R:R=1:{a['nm_rr']:.2f} → {v}"
+            L.append(f"       止损{_money(a['nm_stop_pnl'])} / 目标{_money(a['nm_target_pnl'])}   {rr_txt}")
         elif a.get("nm_stop_pnl") is not None or a.get("nm_target_pnl") is not None:
-            L.append(f"     ▸ 新钱视角: 止损{_money(a.get('nm_stop_pnl'))} / 目标{_money(a.get('nm_target_pnl'))}")
+            L.append(f"       止损{_money(a.get('nm_stop_pnl'))} / 目标{_money(a.get('nm_target_pnl'))}")
     # 减仓情景
     if o.get("trim"):
         t = o["trim"]
@@ -294,6 +363,8 @@ def main():
     ap.add_argument("--cost", type=float, required=True, help="平均成本价")
     ap.add_argument("--stop", type=float, default=None, help="止损价(不填则挂靠技术位建议)")
     ap.add_argument("--target", type=float, default=None, help="目标价(不填则挂靠技术位建议)")
+    ap.add_argument("--stop-amp-mult", type=float, default=STOP_AMP_MULT,
+                    help=f"自动止损最小距离 = 该倍数×近20日均振幅(下限{ANCHOR_BUFFER_PCT:g}%%, 默认{STOP_AMP_MULT:g})")
     ap.add_argument("--fee-pct", type=float, default=0.13, help="双边交易费近似%%(默认0.13: 佣金+印花)")
     ap.add_argument("--add-shares", type=float, default=None, help="加仓股数(配 --add-price)")
     ap.add_argument("--add-price", type=float, default=None, help="加仓价")
@@ -307,7 +378,7 @@ def main():
     live = {"ok": False, "name": None, "code": args.code, "industry": None,
             "price": args.price, "change_pct": None, "freshness": None, "usable": None,
             "cross": None, "ma20": None, "ma60": None, "high_20": None, "low_20": None,
-            "high_60": None, "low_60": None, "kline_ok": False}
+            "high_60": None, "low_60": None, "amp_avg20": None, "kline_ok": False}
     if not args.no_fetch:
         try:
             live = _live(args.code)
@@ -327,7 +398,8 @@ def main():
     o = build(live.get("code") or args.code, args.shares, args.cost, price, anchors,
               live.get("kline_ok", False), stop=args.stop, target=args.target,
               fee_pct=args.fee_pct, add_shares=args.add_shares, add_price=args.add_price,
-              trim_shares=args.trim_shares, trim_price=args.trim_price)
+              trim_shares=args.trim_shares, trim_price=args.trim_price,
+              amp_avg20=live.get("amp_avg20"), stop_amp_mult=args.stop_amp_mult)
 
     if args.json:
         print(json.dumps({"as_of": datetime.now(CST).strftime("%Y-%m-%d %H:%M"),
