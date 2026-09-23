@@ -62,3 +62,51 @@ class TestAvg(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKlineFailure(unittest.TestCase):
+    def test_hint_none_when_ok(self):
+        self.assertIsNone(quote.kline_failure_hint({"ok": True}))
+
+    def test_hint_names_throttle_and_reason(self):
+        h = quote.kline_failure_hint({"ok": False, "reason": "K线数据不足(新股/停牌/接口空)"})
+        self.assertIn("限流", h)
+        self.assertIn("重跑", h)
+        self.assertIn("接口空", h)  # 原始原因要带出来
+        self.assertIn("不是行情信号", h)
+
+    def test_hint_on_missing_kline(self):
+        self.assertIn("原因未知", quote.kline_failure_hint(None))
+
+    def test_retry_refetches_once(self):
+        calls = []
+        orig = quote.fetch_kline
+        quote.fetch_kline = lambda secid: calls.append(secid) or {"ok": True, "ma20": 1.0}
+        try:
+            r = quote.kline_retry({"secid": "0.000066", "kline": {"ok": False}}, wait=0)
+        finally:
+            quote.fetch_kline = orig
+        self.assertEqual(calls, ["0.000066"])
+        self.assertTrue(r["kline"]["ok"])
+
+    def test_retry_skips_when_ok(self):
+        orig = quote.fetch_kline
+        quote.fetch_kline = lambda secid: self.fail("不应重抓")
+        try:
+            r = quote.kline_retry({"secid": "0.000066", "kline": {"ok": True}}, wait=0)
+        finally:
+            quote.fetch_kline = orig
+        self.assertTrue(r["kline"]["ok"])
+
+    def test_retry_exception_kept_as_failure(self):
+        orig = quote.fetch_kline
+
+        def boom(secid):
+            raise TimeoutError("timed out")
+        quote.fetch_kline = boom
+        try:
+            r = quote.kline_retry({"secid": "0.000066", "kline": {"ok": False}}, wait=0)
+        finally:
+            quote.fetch_kline = orig
+        self.assertFalse(r["kline"]["ok"])
+        self.assertIn("timed out", r["kline"]["reason"])

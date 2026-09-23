@@ -650,6 +650,31 @@ def fetch_kline(secid, lmt=120):
     }
 
 
+def kline_retry(r, wait=3.0):
+    """analyze_one 结果里日K失败时隔 wait 秒再抓一次, 就地更新 r["kline"]。
+    push2his 限流常返回'空 data'而非报错, http_get 的重试不会触发, 故在这里补一次。"""
+    kl = r.get("kline") or {}
+    if kl.get("ok") or not r.get("secid"):
+        return r
+    time.sleep(wait)
+    try:
+        r["kline"] = fetch_kline(r["secid"])
+    except Exception as e:  # noqa: BLE001
+        r["kline"] = {"ok": False, "reason": f"K线抓取异常: {e}"}
+    return r
+
+
+def kline_failure_hint(kl):
+    """日K缺失时给用户看的提示; 取到则 None。
+    上市首日/长期停牌才会真的没有K线, 其余几乎都是限流 —— 不能让'价位留空'被读成行情信号。"""
+    if (kl or {}).get("ok"):
+        return None
+    reason = (kl or {}).get("reason") or "原因未知"
+    return (f"日K接口未取到({reason}), 多为东财 push2his 限流: 稍等几秒重跑即可。"
+            f"依赖K线的价位(均线/前高前低/振幅)已留空 —— 这是数据缺失, 不是行情信号"
+            f"(仅上市首日/长期停牌才会真的没有K线)")
+
+
 def cross_validate(tx, em):
     """**一致性**维度: 两源价格是否互相印证, 返回 (verdict, note)。
     新鲜度(是否今日/最近收盘/滞后)由 assess_freshness 单独判, 二者正交。"""

@@ -20,7 +20,7 @@
     python3 position.py 000066 --shares 3500 --cost 18.2 --stop-amp-mult 1.5  # 止损留更宽波动空间
     python3 position.py 000066 --shares 3500 --cost 18.2 --json
 
-退出码: 0 正常; 2 现价抓取失败且未 --price 手填(无法算 PnL)。
+退出码: 0 正常; 2 现价抓取失败且未 --price 手填(无法算 PnL); 3 日K缺失(多为限流), 止损/目标留空, 重跑即可。
 """
 
 import sys
@@ -29,7 +29,7 @@ import math
 import argparse
 from datetime import datetime
 
-from quote import CST, analyze_one, fmt_num
+from quote import CST, analyze_one, fmt_num, kline_retry, kline_failure_hint
 
 FRESH_LABEL = {
     "today": "",
@@ -40,7 +40,7 @@ FRESH_LABEL = {
 
 def _live(code):
     """现价 + 涨跌幅 + 技术锚点 + 新鲜度(腾讯优先退东财)。抓不到 price=None。"""
-    r = analyze_one(code)
+    r = kline_retry(analyze_one(code))
     tx, em = r.get("tencent") or {}, r.get("eastmoney") or {}
     src = tx if (tx.get("ok") and tx.get("price")) else em
     kl = r.get("kline") or {}
@@ -56,6 +56,7 @@ def _live(code):
         "high_60": kl.get("high_60"), "low_60": kl.get("low_60"),
         "amp_avg20": kl.get("amp_avg20"),
         "kline_ok": kl.get("ok", False),
+        "kline_hint": kline_failure_hint(kl),
     }
 
 
@@ -268,6 +269,8 @@ def render(o, live):
         head += f"  〔{live['industry']}〕"
     L.append("=" * 60)
     L.append(f"  {head}  {cross}{('  ' + flag) if flag else ''}")
+    if live.get("kline_hint"):
+        L.append(f"  ⚠️ {live['kline_hint']}")
     L.append(f"    现价 {fmt_num(o['price'])}  涨跌 {fmt_num(live.get('change_pct'), pct=True)}")
     L.append("-" * 60)
     # 当前持仓
@@ -295,14 +298,16 @@ def render(o, live):
         L.append(f"     止损最小距离 {o['stop_buffer_pct']:.2f}%  {_buf_note(o)}"
                  f"; 执行按'收盘破位且次日站不回', 不碰即砍")
     else:
-        L.append("  🛑 止损: 无K线/未手填 → 不臆造, 请 --stop 指定")
+        L.append("  🛑 止损: " + ("日K未取到(见上方提示) → 重跑, 或 --stop 手填" if live.get("kline_hint")
+                                  else "无K线/未手填 → 不臆造, 请 --stop 指定"))
     if o.get("target") is not None:
         basis = f"  挂靠[{o['target_basis']}]" if o.get("target_basis") else "  (手填)"
         warn = "  ⚠️距现价过近" if o.get("target_tooclose") else ""
         L.append(f"  🎯 目标 {fmt_num(o['target'])}{basis}   触发盈利 {_money(o['target_pnl'])}"
                  f"   距现价 {o['target_dist_pct']:+.2f}%{warn}")
     else:
-        L.append("  🎯 目标: 无K线/未手填 → 不臆造, 请 --target 指定")
+        L.append("  🎯 目标: " + ("日K未取到(见上方提示) → 重跑, 或 --target 手填" if live.get("kline_hint")
+                                  else "无K线/未手填 → 不臆造, 请 --target 指定"))
     if o.get("rr") is not None:
         if o.get("rr_distorted"):
             L.append(f"  ⚖️ 盈亏比 R:R = 1:{o['rr']:.1f} ⚠️失真(止损在正常波动之内, 风险分母过小)"
@@ -404,9 +409,12 @@ def main():
     if args.json:
         print(json.dumps({"as_of": datetime.now(CST).strftime("%Y-%m-%d %H:%M"),
                           "live": live, "position": o}, ensure_ascii=False, indent=2))
-        return
-    print(f"抓取时间(本地 CST): {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
-    print(render(o, live))
+    else:
+        print(f"抓取时间(本地 CST): {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(render(o, live))
+    # 自动止损/目标依赖日K; 手填了两者则日K缺失不影响结果, 不报 3
+    if live.get("kline_hint") and not args.no_fetch and (args.stop is None or args.target is None):
+        sys.exit(3)
 
 
 if __name__ == "__main__":

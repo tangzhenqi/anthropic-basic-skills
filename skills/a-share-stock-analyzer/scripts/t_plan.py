@@ -21,7 +21,7 @@
     python3 t_plan.py 000066 --shares 4000 --t-shares 1000 --no-cash      # 无闲钱 → 不给正T
     python3 t_plan.py 000066 --shares 4000 --json
 
-退出码: 0 正常; 2 现价抓取失败。
+退出码: 0 正常; 2 现价抓取失败; 3 数据未取全(日K/日内行情缺, 多为限流, 重跑即可)。
 """
 
 import sys
@@ -30,7 +30,7 @@ import math
 import argparse
 from datetime import datetime
 
-from quote import CST, analyze_one
+from quote import CST, analyze_one, kline_retry, kline_failure_hint
 from position import suggest_stop, stop_buffer_pct
 import trading_calendar as tc
 
@@ -202,7 +202,8 @@ def recommend(state, price, vwap, day_lo, day_hi, direction, near_defense, has_c
 
 
 def plan(price, anchors, amp_avg20, shares, t_shares, state, *, vwap=None, day_lo=None, day_hi=None,
-         prev=None, cost=None, direction=None, has_cash=True, stop=None, fee_kw=None):
+         prev=None, cost=None, direction=None, has_cash=True, stop=None, fee_kw=None,
+         kline_hint=None):
     """纯函数: 由价位与持仓生成完整做T预案(便于离线测试)。"""
     fee_kw = fee_kw or {}
     t_shares = min(t_shares, shares)
@@ -230,9 +231,18 @@ def plan(price, anchors, amp_avg20, shares, t_shares, state, *, vwap=None, day_l
            "vwap": vwap, "day_lo": day_lo, "day_hi": day_hi, "prev": prev,
            "defense": defense, "defense_basis": defense_basis, "near_defense": near_defense,
            "broken_defense": broken_defense,
-           "direction": direction, "has_cash": has_cash, "cost": cost}
+           "direction": direction, "has_cash": has_cash, "cost": cost, "warnings": []}
+    if kline_hint:
+        out["warnings"].append(kline_hint)
+    if state != "off" and vwap is None:
+        out["warnings"].append("今日高/低/均价未取到(腾讯行情缺, 多为限流) → 日内锚点只剩均线与昨日K, 建议重跑")
     if spread is None:
-        out.update(intraday=None, swing=None, action="不做T", why=["无振幅数据(新股/停牌/接口缺) → 不臆造价位"])
+        if kline_hint:  # 缺数据 ≠ 不该做T, 不能给出'不做T'这种像行情结论的动作
+            out.update(intraday=None, swing=None, action="数据未取全, 请重跑",
+                       why=["日K缺失 → 振幅/均线/昨日K 都没有, 算不出挂单价(不臆造)"])
+        else:
+            out.update(intraday=None, swing=None, action="不做T",
+                       why=["K线不足以计算振幅(上市首日/长期停牌) → 不臆造价位"])
         return out
 
     if state == "off":
@@ -259,7 +269,7 @@ def plan(price, anchors, amp_avg20, shares, t_shares, state, *, vwap=None, day_l
 # ---------------------------------------------------------------- 取数与渲染
 
 def _live(code):
-    r = analyze_one(code)
+    r = kline_retry(analyze_one(code))
     tx, em, kl = r.get("tencent") or {}, r.get("eastmoney") or {}, r.get("kline") or {}
     src = tx if (tx.get("ok") and tx.get("price")) else em
     vwap = None
@@ -276,6 +286,7 @@ def _live(code):
                     ("20日前高", kl.get("high_20")), ("20日前低", kl.get("low_20")),
                     ("60日前高", kl.get("high_60")), ("60日前低", kl.get("low_60"))],
         "amp_avg20": kl.get("amp_avg20"), "bars": kl.get("recent_bars") or [],
+        "kline_hint": kline_failure_hint(kl),
     }
 
 
@@ -314,6 +325,8 @@ def render(o, live):
              "inconsistent": "❌两源不一致"}.get(live.get("cross"), "")
     state_txt = {"live": "盘中", "late": "尾盘(14:50后)", "off": "盘外 → 下一交易日预案"}[o["state"]]
     L.append(f"  做T预案  {live.get('name') or ''}({live.get('code')})  {cross}  [{state_txt}]")
+    for w in o.get("warnings") or []:
+        L.append(f"  ⚠️ {w}")
     L.append(f"    现价 {_px(o['price'])}   今日 高{_px(o['day_hi'])} 低{_px(o['day_lo'])} 均价{_px(o['vwap'])}"
              if o["state"] != "off" else f"    最近收盘 {_px(o['price'])}")
     p = o.get("prev") or {}
@@ -323,7 +336,7 @@ def render(o, live):
                  f"    最近交易日({p.get('date')}) 高{_px(p.get('high'))} 低{_px(p.get('low'))} 均价{_px(p.get('vwap'))}")
     amp = o.get("amp_avg20")
     L.append(f"    近20日均振幅 {amp:.2f}%  → 日内目标差价 {o['spread']:.2f}元/股"
-             f"(最小 {o['min_spread']:.3f}, 即3倍往返费)" if o.get("spread") else "    无振幅数据")
+             f"(最小 {o['min_spread']:.3f}, 即3倍往返费)" if o.get("spread") else "    振幅: —(见上方提示)")
     L.append(f"    底仓 {o['shares']:,.0f}股, 每次T {o['t_shares']:,.0f}股"
              + (f"   防守止损 {_px(o['defense'])}[{o['defense_basis']}]" if o.get("defense") else ""))
     L.append("-" * 64)
@@ -354,7 +367,9 @@ def render(o, live):
     sw = o.get("swing")
     L.append("-" * 64)
     L.append("  【波段T: 跨日, 差价更大】")
-    if sw:
+    if o.get("spread") is None:
+        L.append("    —(缺振幅/均线数据, 见上方提示)")
+    elif sw:
         L += _leg_lines(sw, o["t_shares"], o.get("cost"))
         L.append("    卖出条件: 冲到卖价附近但不放量; 放量站稳卖价上方 → 不卖, 转看更高阻力")
     else:
@@ -392,13 +407,16 @@ def main():
     o = plan(price, live["anchors"], live.get("amp_avg20"), args.shares, t_shares, state,
              vwap=live.get("vwap"), day_lo=live.get("day_lo"), day_hi=live.get("day_hi"),
              prev=prev_bar(live["bars"], now, state), cost=args.cost, direction=args.direction,
-             has_cash=not args.no_cash, stop=args.stop, fee_kw={"comm_pct": args.comm_pct, "min_comm": args.min_comm})
+             has_cash=not args.no_cash, stop=args.stop, fee_kw={"comm_pct": args.comm_pct, "min_comm": args.min_comm},
+             kline_hint=live.get("kline_hint"))
     if args.json:
         print(json.dumps({"as_of": now.strftime("%Y-%m-%d %H:%M"), "plan": o},
                          ensure_ascii=False, indent=2, default=str))
-        return
-    print(f"抓取时间(本地 CST): {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(render(o, live))
+    else:
+        print(f"抓取时间(本地 CST): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(render(o, live))
+    if o["warnings"]:
+        sys.exit(3)
 
 
 if __name__ == "__main__":

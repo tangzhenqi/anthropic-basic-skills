@@ -102,9 +102,28 @@ class TestGates(unittest.TestCase):
         self.assertEqual(_plan(15.40, state="late")["action"], "不开新T")
 
     def test_no_amplitude_no_levels(self):
-        o = t_plan.plan(15.40, ANCHORS, None, 4000, 2000, "live", prev=PREV)
+        # K线确实不足(上市首日/长期停牌): 不给价位
+        o = t_plan.plan(15.40, ANCHORS, None, 4000, 2000, "live", prev=PREV, vwap=15.5)
         self.assertEqual(o["action"], "不做T")
         self.assertIsNone(o["intraday"])
+        self.assertEqual(o["warnings"], [])
+
+    def test_kline_throttled_is_not_a_no_t_signal(self):
+        # 限流导致日K缺失: 动作必须是'重跑', 不能是像行情结论的'不做T'
+        hint = "日K接口未取到(...), 多为东财 push2his 限流"
+        o = t_plan.plan(15.40, [(n, None) for n, _ in ANCHORS], None, 4000, 2000, "live",
+                        vwap=15.5, day_lo=15.23, day_hi=15.72, kline_hint=hint)
+        self.assertEqual(o["action"], "数据未取全, 请重跑")
+        self.assertIn(hint, o["warnings"])
+        self.assertIsNone(o["intraday"])
+
+    def test_missing_intraday_quote_warned(self):
+        o = _plan(15.40, vwap=None, day_lo=None, day_hi=None)
+        self.assertTrue(any("今日高/低/均价未取到" in w for w in o["warnings"]))
+
+    def test_off_session_no_intraday_warning(self):
+        o = _plan(15.25, state="off", vwap=None, day_lo=None, day_hi=None)
+        self.assertEqual(o["warnings"], [])
 
 
 class TestSwingAndOff(unittest.TestCase):
